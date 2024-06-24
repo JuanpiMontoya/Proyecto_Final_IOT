@@ -18,7 +18,7 @@ const char * UPDATE_TOPIC = "$aws/things/thing/shadow/update"; // Topico del sha
 const char * UPDATE_DELTA_TOPIC = "$aws/things/thing/shadow/update/delta";  // Topico del shadow - Update Delta
 
 // Certificado raíz de AWS
-const char AMAZON_ROOT_CA1[] PROGMEM = R"EOF( 
+const char AMAZON_ROOT_CA[] PROGMEM = R"EOF( 
 -----BEGIN CERTIFICATE-----
 MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
 ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
@@ -96,7 +96,7 @@ l1W8AUcaxhW9JuFlCakKj4I0Ut/Aa6wUgSJG4Iz3tmMsm8qLP+1/nnTr
 -----END RSA PRIVATE KEY-----
 )KEY";
 
-StaticJsonDocument<2048> inputDoc; // Almacenamos y procesamos los datos de entrada como JSON.
+StaticJsonDocument<512> inputDoc; // Almacenamos y procesamos los datos de entrada como JSON.
 StaticJsonDocument<128> outputDoc; // Almacenamos y procesamos los datos de salida como JSON.
 char outputBuffer[256]; // Almacenamos los JSON antes de ser enviados.
 
@@ -170,7 +170,7 @@ class SolenoidValve {
     }
 
     // Método para abrir o cerrar la válvula
-    void open_or_close(bool valve_state) {
+    void open_or_close(int valve_state) {
         digitalWrite(pin, valve_state); // Cambiamos estado del pin
     }
 
@@ -193,10 +193,6 @@ void callback(const char* topic, byte* payload, unsigned int length) {
     memcpy(jsonBuffer, payload, length);
     jsonBuffer[length] = '\0';
 
-    // Mostrar el JSON recibido para depuración
-    Serial.print("JSON recibido: ");
-    Serial.println(jsonBuffer);
-
     // Deserializar el mensaje JSON
     DeserializationError err = deserializeJson(inputDoc, jsonBuffer);
 
@@ -204,6 +200,12 @@ void callback(const char* topic, byte* payload, unsigned int length) {
         Serial.print(F("deserializeJson() failed: "));
         Serial.println(err.f_str());
         return;
+    }
+
+    // Mostrar el JSON recibido para depuración
+    if (!inputDoc["state"].containsKey("rec_humidity")) {
+      Serial.print("JSON recibido: ");
+      Serial.println(jsonBuffer);
     }
 
     // Verificar si el tópico es el esperado
@@ -216,6 +218,7 @@ void callback(const char* topic, byte* payload, unsigned int length) {
               valve_state = inputDoc["state"]["watering"].as<int8_t>() != 0;
               solenoidValve.open_or_close(valve_state); // Abrimos o cerramos la válvula
               solenoidValve.change_Opened_state(valve_state);
+              reportValue("watering", valve_state);
           }
 
           // Verificar si el campo "water_limit" existe
@@ -223,22 +226,23 @@ void callback(const char* topic, byte* payload, unsigned int length) {
               // Registramos límite de agua
               WATER_LIMIT = inputDoc["state"]["water_limit"].as<int16_t>();
               preferences.putInt("water_limit", WATER_LIMIT);
+              reportValue("water_limit", WATER_LIMIT);
           }
 
           // Registramos área
           if (inputDoc["state"].containsKey("area")) {
               area = inputDoc["state"]["area"].as<int16_t>();
               preferences.putInt("area", area);
+              reportValue("area", area);
           } 
 
           // Registramos tipo de planta
-          if (inputDoc["state"].containsKey("plant_type")) {
+          if (inputDoc["state"].containsKey("plant_type") && !inputDoc["state"].containsKey("rec_humidity")) {
               plant_type = inputDoc["state"]["plant_type"].as<const char*>();
               preferences.putString("plant_type", plant_type);
+              reportPlantType();
           } 
     } 
-    // Reportamos el estado del riego
-    reportWatering();
 } 
 
 
@@ -295,7 +299,7 @@ class MQTTHandler {
 
     // Conectarse al MQTT Broker
     void connectMQTT() {
-      wifiClient.setCACert(AMAZON_ROOT_CA1); // Añadimos el certificado raíz del servidor MQTT
+      wifiClient.setCACert(AMAZON_ROOT_CA); // Añadimos el certificado raíz del servidor MQTT
       wifiClient.setCertificate(CERTIFICATE); // Añadimos el certificado 
       wifiClient.setPrivateKey(PRIVATE_KEY); // Añadimos la clave privada 
 
@@ -334,6 +338,7 @@ MQTTHandler mqttHandler;
 
 void reportWaterSensor() {
   outputDoc["state"]["reported"]["total_used_water"] = totalMilliLitres;
+  outputDoc["state"]["reported"]["water_limit"] = WATER_LIMIT;
   outputDoc["state"]["reported"]["watering"] = 0;
   outputDoc["state"]["reported"]["area"] = area;
   outputDoc["state"]["reported"]["plant_type"] = plant_type;
@@ -341,10 +346,21 @@ void reportWaterSensor() {
   mqttHandler.publishMessage(UPDATE_TOPIC, outputBuffer);
 }
 
-void reportWatering() {
-  outputDoc["state"]["reported"]["watering"] = solenoidValve.isOpened();
-  serializeJson(outputDoc, outputBuffer);
-  mqttHandler.publishMessage(UPDATE_TOPIC, outputBuffer);
+void reportValue(const char* key, unsigned int value) {
+    outputDoc["state"]["reported"][key] = value;
+    serializeJson(outputDoc, outputBuffer);
+    mqttHandler.publishMessage(UPDATE_TOPIC, outputBuffer);
+
+    Serial.print("Reporting ");
+    Serial.println(key);
+}
+
+void reportPlantType() {
+    outputDoc["state"]["reported"]["plant_type"] = plant_type;
+    serializeJson(outputDoc, outputBuffer);
+    mqttHandler.publishMessage(UPDATE_TOPIC, outputBuffer);
+
+    Serial.println("Reporting plant_type");
 }
 
 void setup() {
@@ -364,10 +380,13 @@ void setup() {
   area = preferences.getInt("area", 0);
   plant_type = preferences.getString("plant_type", "");
 
-  if(WATER_LIMIT != 0)
-  {
+
+  if(totalMilliLitres != 0){
     solenoidValve.open_or_close(true); 
+    solenoidValve.change_Opened_state(true);
   }
+
+  reportValue("watering", solenoidValve.isOpened());
 }
 
 void calculateFlowAndPublishData(unsigned long currentMillis) {
@@ -392,7 +411,9 @@ void calculateFlowAndPublishData(unsigned long currentMillis) {
     // Verificar si se superó el límite de agua
     if (totalMilliLitres > WATER_LIMIT) {
       reportWaterSensor(); // Reportar a AWS
+
       solenoidValve.open_or_close(false); // Cerrar la válvula
+      solenoidValve.change_Opened_state(false);
 
       // Borramos valores guardados
       preferences.remove("total_ml");
@@ -400,13 +421,13 @@ void calculateFlowAndPublishData(unsigned long currentMillis) {
       preferences.remove("area");
       preferences.remove("plant_type");
       preferences.end();
-      
+
       while (true) {
         delay(1000);
       }
     }
   } else {
-    Serial.println("NO SE ACTUALIZO LOS DATOS");
+    Serial.println("NO SE ACTUALIZARON TODOS LOS DATOS PARA EL RIEGO");
     delay(2500);
   }
 }
